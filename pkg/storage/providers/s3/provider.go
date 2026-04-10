@@ -3,6 +3,8 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -111,15 +113,30 @@ func NewS3Provider(ctx context.Context, config storage.Config, logger logging.In
 
 // initializeS3Client creates and configures the S3 client
 func initializeS3Client(ctx context.Context, config storage.Config, logger logging.Interface) (*s3.Client, error) {
+	// Build HTTP transport with optional CA bundle for S3-compatible endpoints (Ceph RGW, etc.)
+	transport := &http.Transport{
+		MaxIdleConns:        maxIdleConns,
+		MaxIdleConnsPerHost: maxIdleConns,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	if config.Extra != nil {
+		if caBundle, ok := config.Extra["ca_bundle"].(string); ok && caBundle != "" {
+			caCertPool := x509.NewCertPool()
+			if !caCertPool.AppendCertsFromPEM([]byte(caBundle)) {
+				return nil, fmt.Errorf("failed to parse CA bundle from config.Extra[\"ca_bundle\"]")
+			}
+			transport.TLSClientConfig = &tls.Config{RootCAs: caCertPool}
+			if logger != nil {
+				logger.Info("Using custom CA bundle for S3-compatible endpoint TLS")
+			}
+		}
+	}
+
 	// Build AWS configuration options
 	configOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithHTTPClient(&http.Client{
-			Timeout: httpTimeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        maxIdleConns,
-				MaxIdleConnsPerHost: maxIdleConns,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Timeout:   httpTimeout,
+			Transport: transport,
 		}),
 	}
 
@@ -302,11 +319,27 @@ func (p *S3Provider) Download(ctx context.Context, source string, target string,
 		(options.Concurrency == 0 || options.Concurrency > 1)
 
 	if shouldUseParallel {
-		return p.downloadParallel(ctx, key, actualTarget, metadata.Size, options)
+		if err := p.downloadParallel(ctx, key, actualTarget, metadata.Size, options); err != nil {
+			return err
+		}
+	} else {
+		// Simple download for small files
+		if err := p.downloadSimple(ctx, key, actualTarget); err != nil {
+			return err
+		}
 	}
 
-	// Simple download for small files
-	return p.downloadSimple(ctx, key, actualTarget)
+	// Validate integrity after download if ETag is available
+	if metadata.ETag != "" {
+		if err := p.validateIntegrity(actualTarget, metadata.ETag, metadata.Metadata); err != nil {
+			p.logger.WithField("key", key).WithField("target", actualTarget).
+				Warn(fmt.Sprintf("Integrity validation failed, removing downloaded file: %v", err))
+			os.Remove(actualTarget)
+			return fmt.Errorf("integrity validation failed for %s: %w", key, err)
+		}
+	}
+
+	return nil
 }
 
 // downloadSimple performs a simple download

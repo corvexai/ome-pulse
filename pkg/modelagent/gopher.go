@@ -22,6 +22,7 @@ import (
 	"github.com/sgl-project/ome/pkg/logging"
 	"github.com/sgl-project/ome/pkg/ociobjectstore"
 	"github.com/sgl-project/ome/pkg/principals"
+	storagesdk "github.com/sgl-project/ome/pkg/storage"
 	"github.com/sgl-project/ome/pkg/utils"
 	"github.com/sgl-project/ome/pkg/utils/storage"
 	"github.com/sgl-project/ome/pkg/xet"
@@ -378,6 +379,11 @@ func (s *Gopher) processTask(task *GopherTask) error {
 				// Error is already logged and metrics recorded in the method
 				return err
 			}
+		case storage.StorageTypeS3:
+			s.logger.Infof("Starting S3 download for model %s", modelInfo)
+			if err := s.processS3Model(ctx, task, baseModelSpec, modelInfo, modelType, namespace, name); err != nil {
+				return err
+			}
 		case storage.StorageTypePVC:
 			s.logger.Infof("Skipping PVC storage type for model %s (handled by BaseModel controller)", modelInfo)
 			// PVC storage is handled entirely by the BaseModel controller
@@ -476,6 +482,21 @@ func (s *Gopher) processTask(task *GopherTask) error {
 					return err
 				}
 				s.logger.Infof("Successfully deleted Hugging Face model %s", modelInfo)
+			}
+		case storage.StorageTypeS3:
+			destPath := getDestPath(&baseModelSpec, s.modelRootDir)
+			s.logger.Infof("Deleting S3 model %s from local cache %s", modelInfo, destPath)
+			isReferenced, err := s.isPathReferencedByOtherModels(destPath, task.BaseModel, task.ClusterBaseModel)
+			if err != nil {
+				s.logger.Errorf("Failed to check if path %s is referenced by other models, skip the path deletion: %v", destPath, err)
+			} else if isReferenced {
+				s.logger.Infof("Skipping deletion of path %s for model %s as it is still referenced by other models", destPath, modelInfo)
+			} else {
+				if err := s.deleteModel(destPath, task); err != nil {
+					s.logger.Errorf("Failed to delete S3 model %s: %v", modelInfo, err)
+					return err
+				}
+				s.logger.Infof("Successfully deleted S3 model %s", modelInfo)
 			}
 		case storage.StorageTypeLocal:
 			s.logger.Infof("Skipping deletion for local storage model %s (local files should not be deleted)", modelInfo)
@@ -648,6 +669,224 @@ func (s *Gopher) getHuggingFaceToken(task *GopherTask, baseModelSpec v1beta1.Bas
 	}
 
 	return hfToken
+}
+
+// getS3Credentials reads S3 credentials from a K8s Secret referenced by StorageKey
+// and builds a storage.Config suitable for creating an S3 provider via the factory.
+//
+// Secret keys: access_key_id (required), secret_access_key (required),
+// session_token, region, endpoint, ca_bundle (all optional).
+func (s *Gopher) getS3Credentials(task *GopherTask, baseModelSpec v1beta1.BaseModelSpec,
+	s3Components *storage.S3StorageComponents, modelInfo string) (*storagesdk.Config, error) {
+
+	var namespace string
+	if task.BaseModel != nil {
+		namespace = task.BaseModel.Namespace
+	} else if task.ClusterBaseModel != nil {
+		namespace = "ome"
+	}
+
+	config := &storagesdk.Config{
+		Provider: storagesdk.ProviderS3,
+		Bucket:   s3Components.Bucket,
+		Region:   s3Components.Region,
+		Extra:    make(map[string]interface{}),
+	}
+
+	// Region priority: Secret > URI @region > Parameters
+	if baseModelSpec.Storage.Parameters != nil {
+		if region, exists := (*baseModelSpec.Storage.Parameters)["region"]; exists && region != "" && config.Region == "" {
+			config.Region = region
+		}
+		if endpoint, exists := (*baseModelSpec.Storage.Parameters)["endpoint"]; exists && endpoint != "" {
+			config.Endpoint = endpoint
+		}
+	}
+
+	// If StorageKey is set, read credentials from the K8s Secret
+	if baseModelSpec.Storage.StorageKey != nil && *baseModelSpec.Storage.StorageKey != "" {
+		if s.kubeClient == nil {
+			return nil, fmt.Errorf("cannot fetch S3 credentials: Kubernetes client not initialized")
+		}
+
+		s.logger.Infof("Fetching S3 credentials from secret %s in namespace %s for model %s",
+			*baseModelSpec.Storage.StorageKey, namespace, modelInfo)
+
+		secret, err := s.kubeClient.CoreV1().Secrets(namespace).Get(
+			context.Background(), *baseModelSpec.Storage.StorageKey, metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to retrieve S3 credentials secret %s in namespace %s: %w",
+				*baseModelSpec.Storage.StorageKey, namespace, err)
+		}
+
+		accessKeyID := string(secret.Data["access_key_id"])
+		secretAccessKey := string(secret.Data["secret_access_key"])
+
+		if accessKeyID == "" || secretAccessKey == "" {
+			return nil, fmt.Errorf("S3 credentials secret %s missing required keys access_key_id and/or secret_access_key",
+				*baseModelSpec.Storage.StorageKey)
+		}
+
+		authExtra := map[string]interface{}{
+			"access_key": map[string]interface{}{
+				"access_key_id":     accessKeyID,
+				"secret_access_key": secretAccessKey,
+			},
+		}
+		if sessionToken := string(secret.Data["session_token"]); sessionToken != "" {
+			authExtra["access_key"].(map[string]interface{})["session_token"] = sessionToken
+		}
+
+		config.AuthConfig = &storagesdk.AuthConfig{
+			Provider: "aws",
+			Type:     "access_key",
+			Region:   config.Region,
+			Extra:    authExtra,
+		}
+
+		// Override region/endpoint from Secret if present
+		if region := string(secret.Data["region"]); region != "" {
+			config.Region = region
+			config.AuthConfig.Region = region
+		}
+		if endpoint := string(secret.Data["endpoint"]); endpoint != "" {
+			config.Endpoint = endpoint
+		}
+		if caBundle := string(secret.Data["ca_bundle"]); caBundle != "" {
+			config.Extra["ca_bundle"] = caBundle
+		}
+
+		s.logger.Infof("S3 credentials loaded from secret %s (region=%s, endpoint=%s, ca_bundle=%v)",
+			*baseModelSpec.Storage.StorageKey, config.Region, config.Endpoint, config.Extra["ca_bundle"] != nil)
+	} else {
+		// No StorageKey — use AWS SDK default credential chain (instance profile, env vars, etc.)
+		s.logger.Infof("No StorageKey set for model %s, using AWS default credential chain", modelInfo)
+		config.AuthConfig = &storagesdk.AuthConfig{
+			Provider: "aws",
+			Type:     "default",
+			Region:   config.Region,
+		}
+	}
+
+	return config, nil
+}
+
+// processS3Model downloads model weights from an S3-compatible bucket to local disk.
+// This follows the same lifecycle pattern as processHuggingFaceModel: parse URI, get creds,
+// download to destPath, then parse model config and update metadata.
+func (s *Gopher) processS3Model(ctx context.Context, task *GopherTask, baseModelSpec v1beta1.BaseModelSpec,
+	modelInfo, modelType, namespace, name string) error {
+
+	// Parse the S3 URI to get bucket, prefix, and optional region
+	s3Components, err := storage.ParseS3StorageURI(*baseModelSpec.Storage.StorageUri)
+	if err != nil {
+		s.logger.Errorf("Failed to parse S3 URI for model %s: %v", modelInfo, err)
+		s.metrics.RecordFailedDownload(modelType, namespace, name, "invalid_s3_uri")
+		s.markModelOnNodeFailed(task)
+		return err
+	}
+
+	if s3Components.Prefix == "" {
+		err := fmt.Errorf("S3 URI %s has no prefix — bucket-only URIs are not supported (would list entire bucket)", *baseModelSpec.Storage.StorageUri)
+		s.logger.Errorf("Invalid S3 URI for model %s: %v", modelInfo, err)
+		s.metrics.RecordFailedDownload(modelType, namespace, name, "invalid_s3_uri")
+		s.markModelOnNodeFailed(task)
+		return err
+	}
+
+	// Build storage config with credentials from K8s Secret or default chain
+	storageConfig, err := s.getS3Credentials(task, baseModelSpec, s3Components, modelInfo)
+	if err != nil {
+		s.logger.Errorf("Failed to get S3 credentials for model %s: %v", modelInfo, err)
+		s.metrics.RecordFailedDownload(modelType, namespace, name, "s3_credentials_error")
+		s.markModelOnNodeFailed(task)
+		return err
+	}
+
+	// Compute local destination path (same logic as HF/OCI)
+	destPath := getDestPath(&baseModelSpec, s.modelRootDir)
+
+	// Check if model is already cached locally (cache-skip)
+	if info, err := os.Stat(destPath); err == nil && info.IsDir() {
+		entries, _ := os.ReadDir(destPath)
+		hasWeights := false
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".safetensors") || strings.HasSuffix(e.Name(), ".bin") {
+				hasWeights = true
+				break
+			}
+		}
+		if hasWeights {
+			s.logger.Infof("Model %s already cached at %s, skipping S3 download", modelInfo, destPath)
+			// Still parse and update model config for metadata
+			s.safeParseAndUpdateModelConfig(destPath, task.BaseModel, task.ClusterBaseModel, "")
+			return nil
+		}
+	}
+
+	// Create destination directory
+	if err := os.MkdirAll(destPath, 0755); err != nil {
+		s.logger.Errorf("Failed to create destination directory %s for model %s: %v", destPath, modelInfo, err)
+		s.metrics.RecordFailedDownload(modelType, namespace, name, "s3_mkdir_error")
+		s.markModelOnNodeFailed(task)
+		return err
+	}
+
+	// Create S3 provider via factory
+	provider, err := storagesdk.GetGlobalFactory().CreateStorage(ctx, *storageConfig)
+	if err != nil {
+		s.logger.Errorf("Failed to create S3 storage provider for model %s: %v", modelInfo, err)
+		s.metrics.RecordFailedDownload(modelType, namespace, name, "s3_provider_error")
+		s.markModelOnNodeFailed(task)
+		return err
+	}
+
+	// List all objects under the model's prefix
+	s.logger.Infof("Listing objects in s3://%s/%s for model %s", s3Components.Bucket, s3Components.Prefix, modelInfo)
+	objects, err := provider.List(ctx, s3Components.Prefix)
+	if err != nil {
+		s.logger.Errorf("Failed to list S3 objects for model %s: %v", modelInfo, err)
+		s.metrics.RecordFailedDownload(modelType, namespace, name, "s3_list_error")
+		s.markModelOnNodeFailed(task)
+		return err
+	}
+
+	if len(objects) == 0 {
+		err := fmt.Errorf("no objects found in s3://%s/%s", s3Components.Bucket, s3Components.Prefix)
+		s.logger.Errorf("S3 download failed for model %s: %v", modelInfo, err)
+		s.metrics.RecordFailedDownload(modelType, namespace, name, "s3_empty_prefix")
+		s.markModelOnNodeFailed(task)
+		return err
+	}
+
+	s.logger.Infof("Found %d objects to download for model %s", len(objects), modelInfo)
+
+	// Download each object, preserving directory structure relative to the prefix
+	for i, obj := range objects {
+		// Compute relative path by stripping the prefix
+		relPath := strings.TrimPrefix(obj.Name, s3Components.Prefix)
+		relPath = strings.TrimPrefix(relPath, "/")
+		if relPath == "" {
+			continue // skip the prefix directory marker itself
+		}
+
+		targetPath := filepath.Join(destPath, relPath)
+
+		s.logger.Infof("Downloading [%d/%d] %s → %s", i+1, len(objects), obj.Name, targetPath)
+		if err := provider.Download(ctx, obj.Name, targetPath); err != nil {
+			s.logger.Errorf("Failed to download S3 object %s for model %s: %v", obj.Name, modelInfo, err)
+			s.metrics.RecordFailedDownload(modelType, namespace, name, "s3_download_error")
+			s.markModelOnNodeFailed(task)
+			return err
+		}
+	}
+
+	s.logger.Infof("S3 download complete for model %s (%d objects to %s)", modelInfo, len(objects), destPath)
+
+	// Parse model config and update metadata
+	s.safeParseAndUpdateModelConfig(destPath, task.BaseModel, task.ClusterBaseModel, "")
+
+	return nil
 }
 
 func getDestPath(baseModel *v1beta1.BaseModelSpec, modelRootDir string) string {

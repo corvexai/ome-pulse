@@ -25,6 +25,7 @@ import (
 	omev1beta1informers "github.com/sgl-project/ome/pkg/client/informers/externalversions"
 	"github.com/sgl-project/ome/pkg/logging"
 	"github.com/sgl-project/ome/pkg/modelagent"
+	_ "github.com/sgl-project/ome/pkg/storage/providers/s3" // Register S3 storage provider for s3:// model URIs
 	"github.com/sgl-project/ome/pkg/version"
 	"github.com/sgl-project/ome/pkg/xet"
 )
