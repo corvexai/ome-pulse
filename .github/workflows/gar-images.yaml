@@ -1,0 +1,117 @@
+name: GAR Images
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GAR_LOCATION: ${{ vars.GAR_LOCATION || 'us-east4-docker.pkg.dev' }}
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GAR_REPOSITORY: ignite-orchestrator
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - { name: manager,           dockerfile: dockerfiles/manager.Dockerfile,           image: ome-manager }
+          - { name: model-agent,       dockerfile: dockerfiles/model-agent.Dockerfile,       image: model-agent }
+          - { name: multinode-prober,  dockerfile: dockerfiles/multinode-prober.Dockerfile,  image: multinode-prober }
+          - { name: ome-agent,         dockerfile: dockerfiles/ome-agent.Dockerfile,         image: ome-agent }
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Compute version metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          {
+            echo "short_sha=${SHORT_SHA}"
+            echo "long_sha=${GITHUB_SHA}"
+            echo "image_base=${GAR_LOCATION}/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/${{ matrix.component.image }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure docker for GAR
+        run: gcloud auth configure-docker ${{ env.GAR_LOCATION }} --quiet
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Build and push ${{ matrix.component.name }}
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.component.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_base }}:${{ steps.meta.outputs.long_sha }}
+            ${{ steps.meta.outputs.image_base }}:${{ steps.meta.outputs.short_sha }}
+          cache-from: type=gha,scope=gar-${{ matrix.component.name }}
+          cache-to: type=gha,mode=max,scope=gar-${{ matrix.component.name }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.short_sha }}
+            GIT_TAG=${{ steps.meta.outputs.short_sha }}
+            GIT_COMMIT=${{ steps.meta.outputs.long_sha }}
+
+      - name: Sign image (cosign keyless)
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          cosign sign --yes ${{ steps.meta.outputs.image_base }}@${{ steps.build.outputs.digest }}
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.meta.outputs.image_base }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: ${{ matrix.component.image }}-sbom.spdx.json
+
+      - name: Attach SBOM
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          cosign attach sbom \
+            --sbom ${{ matrix.component.image }}-sbom.spdx.json \
+            ${{ steps.meta.outputs.image_base }}@${{ steps.build.outputs.digest }}
+
+  summary:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Job summary
+        run: |
+          SHORT=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          {
+            echo "## GAR Images Pushed"
+            echo ""
+            echo "Commit: \`${GITHUB_SHA}\`"
+            echo ""
+            echo "| Component | Image |"
+            echo "|---|---|"
+            for img in ome-manager model-agent multinode-prober ome-agent; do
+              echo "| ${img} | \`${{ env.GAR_LOCATION }}/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${img}:${SHORT}\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
