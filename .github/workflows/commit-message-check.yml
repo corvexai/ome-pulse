@@ -1,0 +1,22 @@
+name: Commit Message Check
+
+on:
+  pull_request:
+    types:
+      - edited
+      - opened
+      - reopened
+      - synchronize
+
+jobs:
+  commit-message-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check commit message
+        uses: corvexai/gha-commit-message-check@9af3a50e9d082f3c865b5563d543c928504d26e2 # v0.1.0
+        with:
+          mode: strict
+          check_title: true
+          check_commits: false
