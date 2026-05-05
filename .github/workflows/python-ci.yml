@@ -1,0 +1,19 @@
+name: Python CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    name: Python CI
+    uses: corvexai/gha-python-ci/.github/workflows/ci.yml@cb035fd6749c198adb47fc22a50c03839f4f5319 # v0.1.0
+    with:
+      workflow_ref: cb035fd6749c198adb47fc22a50c03839f4f5319
+      python_version: '3.12'
+    secrets: inherit
+    permissions:
+      contents: read
+      pull-requests: write
