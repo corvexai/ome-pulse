@@ -1,0 +1,25 @@
+name: Auto Semantic Version
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  tag:
+    name: Tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Increment version and create tag
+        id: create-tag
+        uses: corvexai/gha-auto-semver@fe3a7f81000b897d3f7bfdedd6edc7334765ce16 # v0.1.2
+        with:
+          create_tag: true
+          initial_version: 0.1.0
